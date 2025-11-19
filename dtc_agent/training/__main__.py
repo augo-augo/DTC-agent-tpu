@@ -1,0 +1,654 @@
+from __future__ import annotations
+
+import os
+
+import os
+
+import argparse
+import threading
+import time
+from pathlib import Path
+from queue import Queue
+from typing import Dict, List, Tuple
+
+import crafter
+import numpy as np
+import torch
+import torch.nn.functional as F
+import wandb
+from omegaconf import OmegaConf
+
+from dtc_agent.config import load_training_config
+from dtc_agent.training import StepResult, TrainingLoop
+from dtc_agent.training.loop import LatentSnapshot, module_state_dict
+from dtc_agent.training.wandb_logger import WandBLogger
+from dtc_agent.agents import ActorNetwork, ActorConfig
+from dtc_agent.world_model.ensemble import WorldModelEnsemble, WorldModelConfig
+try:
+    import torch_xla.core.xla_model as xm
+except ImportError:
+    xm = None
+
+
+def _frame_to_chw(frame: np.ndarray) -> np.ndarray:
+    array = np.asarray(frame)
+    if array.ndim == 2:
+        array = np.repeat(array[..., None], repeats=3, axis=2)
+    if array.shape[-1] == 1:
+        array = np.repeat(array, repeats=3, axis=2)
+    if array.dtype != np.uint8:
+        array = np.clip(array * 255.0, 0.0, 255.0).astype(np.uint8)
+    return array.transpose(2, 0, 1)
+
+
+def _preprocess_frame(
+    frame: np.ndarray, target_shape: Tuple[int, int, int], device: torch.device
+) -> torch.Tensor:
+    array = np.asarray(frame)
+    if array.ndim == 2:
+        array = np.expand_dims(array, -1)
+    tensor = torch.from_numpy(array)
+    if tensor.ndim != 3:
+        raise ValueError(f"Observation must be [H, W, C] or [C, H, W], got {tensor.shape}")
+    if tensor.shape[-1] == target_shape[0]:
+        tensor = tensor.permute(2, 0, 1)
+    elif tensor.shape[0] != target_shape[0]:
+        raise ValueError(f"Incompatible observation shape {tensor.shape} for expected {target_shape}")
+    tensor = tensor.to(dtype=torch.float32)
+    if tensor.max().item() > 1.0:
+        tensor = tensor / 255.0
+    tensor = tensor.unsqueeze(0)
+    spatial_size = (target_shape[1], target_shape[2])
+    if tensor.shape[-2:] != spatial_size:
+        tensor = F.interpolate(tensor, size=spatial_size, mode="bilinear", align_corners=False)
+    if tensor.shape[1] != target_shape[0]:
+        if tensor.shape[1] == 1 and target_shape[0] == 3:
+            tensor = tensor.repeat(1, target_shape[0], 1, 1)
+        else:
+            raise ValueError("Unable to match channel count for observation tensor")
+    tensor = tensor.clamp(0.0, 1.0).contiguous()
+    return tensor
+
+
+def _detach_step_result(result: StepResult) -> StepResult:
+    def _tensor_to_cpu(value: torch.Tensor) -> torch.Tensor:
+        return value.detach().to("cpu")
+
+    result.action = _tensor_to_cpu(result.action)
+    result.intrinsic_reward = _tensor_to_cpu(result.intrinsic_reward)
+    result.novelty = _tensor_to_cpu(result.novelty)
+    result.observation_entropy = _tensor_to_cpu(result.observation_entropy)
+    result.slot_scores = _tensor_to_cpu(result.slot_scores)
+    if result.epistemic_novelty is not None:
+        result.epistemic_novelty = _tensor_to_cpu(result.epistemic_novelty)
+
+    if result.reward_components is not None:
+        result.reward_components = {
+            name: _tensor_to_cpu(value) for name, value in result.reward_components.items()
+        }
+    if result.raw_reward_components is not None:
+        result.raw_reward_components = {
+            name: _tensor_to_cpu(value) for name, value in result.raw_reward_components.items()
+        }
+    if result.competence_breakdown is not None:
+        result.competence_breakdown = {
+            name: _tensor_to_cpu(value) for name, value in result.competence_breakdown.items()
+        }
+    if result.latent_snapshot is not None:
+        snapshot = result.latent_snapshot
+        result.latent_snapshot = LatentSnapshot(
+            z_self=_tensor_to_cpu(snapshot.z_self),
+            slots=_tensor_to_cpu(snapshot.slots),
+            latent_state=_tensor_to_cpu(snapshot.latent_state),
+        )
+    if result.real_action_entropy is not None:
+        result.real_action_entropy = _tensor_to_cpu(result.real_action_entropy)
+    return result
+
+
+def _compute_self_state(
+    info: dict | None, step_count: int, horizon: int, state_dim: int
+) -> torch.Tensor:
+    """Derive self-centric signals from Crafter status fields."""
+    if state_dim <= 0:
+        return torch.empty(0, dtype=torch.float32)
+
+    source = info or {}
+
+    def _lookup(key: str, default: float) -> float:
+        if isinstance(source, dict):
+            if key in source:
+                return float(source[key])
+            stats = source.get("stats")
+            if isinstance(stats, dict) and key in stats:
+                return float(stats[key])
+        return float(default)
+
+    health = _lookup("health", 9.0)
+    food = _lookup("food", 9.0)
+    health_norm = np.clip(health / 9.0, 0.0, 1.0)
+    food_norm = np.clip(food / 9.0, 0.0, 1.0)
+
+    denom = max(1, horizon)
+    energy = max(0.0, 1.0 - step_count / denom)
+    is_sleeping = _lookup("is_sleeping", source.get("sleep", source.get("sleeping", 0.0)))
+
+    health_critical = 1.0 if health < 3.0 else 0.0
+    food_critical = 1.0 if food < 2.0 else 0.0
+
+    features: List[float] = [
+        health_norm,
+        food_norm,
+        energy,
+        is_sleeping,
+        health_critical,
+        food_critical,
+    ]
+    if state_dim <= len(features):
+        selected = features[:state_dim]
+    else:
+        selected = features + [0.0] * (state_dim - len(features))
+    return torch.tensor(selected, dtype=torch.float32)
+
+
+def _select_env_action(action_tensor: torch.Tensor, action_space_n: int) -> int:
+    if action_tensor.ndim != 2:
+        raise ValueError("Expected batched action tensor from TrainingLoop.step")
+    usable = min(action_tensor.shape[-1], action_space_n)
+    slice_tensor = action_tensor[0, :usable]
+    index = int(torch.argmax(slice_tensor).item())
+    return index % action_space_n
+
+
+def _actor_loop(
+    worker_id: int,
+    loop: TrainingLoop,
+    config,
+    runtime_device: torch.device,
+    max_steps: int,
+    log_interval: int,
+    video_step_interval: int,
+    steps_lock: threading.Lock,
+    shared_state: Dict[str, int],
+    stop_event: threading.Event,
+    metrics_queue: Queue,
+    seed: int,
+) -> None:
+    device_index: int | None = None
+    if runtime_device.type == "cuda":
+        device_index = runtime_device.index
+        if device_index is None:
+            try:
+                device_index = torch.cuda.current_device()
+            except RuntimeError:
+                device_index = 0
+        torch.cuda.set_device(device_index)
+    env = crafter.Env()
+
+    try:
+        if hasattr(env, "seed"):
+            env.seed(seed)
+        episode_frames: List[np.ndarray] = []
+        episode_steps = 0
+        observation = env.reset()
+        frame = observation
+        observation_tensor = _preprocess_frame(frame, config.encoder.observation_shape, runtime_device)
+        with steps_lock:
+            shared_state["episodes"] += 1
+            episode_id = shared_state["episodes"]
+        self_state_vec = _compute_self_state(
+            info=None,
+            step_count=episode_steps,
+            horizon=max_steps,
+            state_dim=config.self_state_dim,
+        ).unsqueeze(0)
+        episode_frames = [_frame_to_chw(frame)]
+
+        # Local actor snapshot for lock-free inference
+        # We reconstruct the config to create an independent model instance
+        slot_dim = config.encoder.slot_dim
+        policy_feature_dim = (
+            slot_dim
+            + slot_dim * config.workspace.broadcast_slots
+            + config.episodic_memory.key_dim
+            + loop.temporal_self.field_dim
+        )
+        actor_cfg = ActorConfig(
+            latent_dim=policy_feature_dim,
+            action_dim=config.dynamics.action_dim,
+            hidden_dim=config.actor.hidden_dim,
+            num_layers=config.actor.num_layers,
+            dropout=config.actor.dropout,
+        )
+        actor_snapshot = ActorNetwork(actor_cfg).to(runtime_device)
+        actor_snapshot.load_state_dict(module_state_dict(loop.actor_eval))
+        actor_snapshot.eval()
+
+        # World Model snapshot for lock-free inference
+        wm_config = WorldModelConfig(
+            encoder=config.encoder,
+            decoder=config.decoder,
+            dynamics=config.dynamics,
+            ensemble_size=config.world_model_ensemble,
+        )
+        wm_snapshot = WorldModelEnsemble(wm_config).to(runtime_device)
+        wm_snapshot.load_state_dict(module_state_dict(loop.world_model))
+        wm_snapshot.eval()
+        last_snapshot_update = 0
+
+        while not stop_event.is_set():
+            # Periodic snapshot update (every ~100 steps)
+            # We use a simple counter check. Since loop.actor_eval is updated by the main thread,
+            # we might read slightly stale weights, which is fine.
+            # Ideally we would use a lock to read loop.actor_eval, but we want to avoid contention.
+            # loop.actor_eval is updated in _optimize -> refresh_policy_snapshot.
+            if shared_state["steps"] - last_snapshot_update > 100:
+                try:
+                    # Quick copy to avoid holding any locks for long
+                    state_dict = {k: v.clone() for k, v in module_state_dict(loop.actor_eval).items()}
+                    actor_snapshot.load_state_dict(state_dict)
+
+                    wm_state = {k: v.clone() for k, v in module_state_dict(loop.world_model).items()}
+                    wm_snapshot.load_state_dict(wm_state)
+                    last_snapshot_update = shared_state["steps"]
+                except Exception:
+                    # If we catch a race condition (rare), just skip this update
+                    pass
+
+            with torch.no_grad():
+                policy_result = loop.step(
+                    observation_tensor,
+                    self_state=self_state_vec if self_state_vec.numel() > 0 else None,
+                    train=False,
+                    actor_model=actor_snapshot,
+                    world_model=wm_snapshot,
+                )
+            if device_index is not None:
+                torch.cuda.synchronize(device_index)
+            policy_result = _detach_step_result(policy_result)
+            env_action = _select_env_action(policy_result.action, env.action_space.n)
+            next_observation, env_reward, terminated, info = env.step(env_action)
+            truncated = False
+            next_tensor = _preprocess_frame(
+                next_observation, config.encoder.observation_shape, runtime_device
+            )
+            loop.store_transition(
+                observation_tensor,
+                policy_result.action,
+                next_tensor,
+                self_state_vec if self_state_vec.numel() > 0 else None,
+            )
+            loop.store_latent_transition(
+                policy_result.latent_snapshot,
+                policy_result.action,
+                next_tensor,
+                world_model=wm_snapshot,
+            )
+            next_episode_steps = episode_steps + 1
+            next_self_state_vec = _compute_self_state(
+                info,
+                next_episode_steps,
+                max_steps,
+                config.self_state_dim,
+            ).unsqueeze(0)
+            episode_frames.append(_frame_to_chw(next_observation))
+            with steps_lock:
+                if shared_state["steps"] >= max_steps:
+                    stop_event.set()
+                    step_index = shared_state["steps"]
+                    reached_limit = True
+                else:
+                    shared_state["steps"] += 1
+                    step_index = shared_state["steps"]
+                    reached_limit = shared_state["steps"] >= max_steps
+                    if reached_limit:
+                        stop_event.set()
+            info_dict = info if isinstance(info, dict) else {}
+            reward_components = {}
+            if policy_result.reward_components is not None:
+                reward_components = {
+                    name: float(value.mean().item())
+                    for name, value in policy_result.reward_components.items()
+                }
+            raw_components = {}
+            if policy_result.raw_reward_components is not None:
+                raw_components = {
+                    name: float(value.mean().item())
+                    for name, value in policy_result.raw_reward_components.items()
+                }
+            self_state_list: List[float] = []
+            if next_self_state_vec.numel() > 0:
+                self_state_list = [float(x) for x in next_self_state_vec.squeeze(0).tolist()]
+            competence_breakdown = policy_result.competence_breakdown or {}
+            progress_tensor = competence_breakdown.get("progress")
+            penalty_tensor = competence_breakdown.get("penalty")
+            ema_prev_tensor = competence_breakdown.get("ema_prev")
+            ema_current_tensor = competence_breakdown.get("ema_current")
+            competence_progress = (
+                float(progress_tensor.mean().item())
+                if isinstance(progress_tensor, torch.Tensor)
+                else 0.0
+            )
+            competence_penalty = (
+                float(penalty_tensor.mean().item())
+                if isinstance(penalty_tensor, torch.Tensor)
+                else 0.0
+            )
+            competence_ema_prev = (
+                float(ema_prev_tensor.item())
+                if isinstance(ema_prev_tensor, torch.Tensor)
+                else 0.0
+            )
+            competence_ema_current = (
+                float(ema_current_tensor.item())
+                if isinstance(ema_current_tensor, torch.Tensor)
+                else 0.0
+            )
+            epistemic_value = (
+                float(policy_result.epistemic_novelty.mean().item())
+                if isinstance(policy_result.epistemic_novelty, torch.Tensor)
+                else 0.0
+            )
+            real_entropy_value = (
+                float(policy_result.real_action_entropy.item())
+                if policy_result.real_action_entropy is not None
+                else 0.0
+            )
+            should_log = log_interval > 0 and step_index % log_interval == 0
+            achievements = info_dict.get("achievements") if isinstance(info_dict, dict) else None
+            achievements_count = len(achievements) if isinstance(achievements, dict) else 0
+            metrics_queue.put(
+                {
+                    "kind": "step",
+                    "worker": worker_id,
+                    "step": step_index,
+                    "episode": episode_id,
+                    "episode_steps": next_episode_steps,
+                    "intrinsic": float(policy_result.intrinsic_reward.mean().item()),
+                    "novelty": float(policy_result.novelty.mean().item()),
+                    "entropy": float(policy_result.observation_entropy.mean().item()),
+                    "env_reward": float(env_reward),
+                    "reward_components": reward_components,
+                    "raw_reward_components": raw_components,
+                    "self_state": self_state_list,
+                    "info": info_dict,
+                    "log": should_log,
+                    "done": terminated or truncated or reached_limit,
+                    "achievements_count": achievements_count,
+                    "epistemic_novelty": epistemic_value,
+                    "competence_progress": competence_progress,
+                    "competence_penalty": competence_penalty,
+                    "competence_ema_prev": competence_ema_prev,
+                    "competence_ema_current": competence_ema_current,
+                    "real_action_entropy": real_entropy_value,
+                }
+            )
+            done = terminated or truncated or reached_limit
+            should_upload_video = False
+            if done:
+                with steps_lock:
+                    last_video_step = shared_state.get("last_video_step", 0)
+                    current_step = shared_state["steps"]
+                    if current_step - last_video_step >= video_step_interval:
+                        shared_state["last_video_step"] = current_step
+                        should_upload_video = True
+            if (
+                done
+                and should_upload_video
+                and episode_frames
+                and len(episode_frames) > 1
+            ):
+                try:
+                    video_array = np.stack(episode_frames, axis=0)
+                except ValueError:
+                    video_array = None
+                if video_array is not None:
+                    metrics_queue.put(
+                        {
+                            "kind": "video",
+                            "worker": worker_id,
+                            "step": step_index,
+                            "episode": episode_id,
+                            "frames": video_array,
+                            "info": info_dict,
+                            "truncated": reached_limit and not terminated and not truncated,
+                        }
+                    )
+            if done:
+                if shared_state["steps"] >= max_steps:
+                    break
+                observation = env.reset()
+                frame = observation
+                observation_tensor = _preprocess_frame(
+                    frame, config.encoder.observation_shape, runtime_device
+                )
+                episode_steps = 0
+                with steps_lock:
+                    shared_state["episodes"] += 1
+                    episode_id = shared_state["episodes"]
+                episode_frames = [_frame_to_chw(frame)]
+                self_state_vec = _compute_self_state(
+                    info=None,
+                    step_count=episode_steps,
+                    horizon=max_steps,
+                    state_dim=config.self_state_dim,
+                ).unsqueeze(0)
+                continue
+            observation_tensor = next_tensor
+            self_state_vec = next_self_state_vec
+            episode_steps = next_episode_steps
+    finally:
+        if hasattr(env, "close"):
+            env.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="SC-GWT training harness (Crafter integration)")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/default.yaml"),
+        help="Path to YAML configuration file.",
+    )
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        help="Override configuration values (OmegaConf dotlist syntax).",
+    )
+    parser.add_argument("--device", default=None, help="Runtime device override.")
+    parser.add_argument("--seed", type=int, default=0, help="Environment reset seed.")
+    parser.add_argument(
+        "--max-steps", type=int, default=5000, help="Total environment steps to execute."
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=50,
+        help="How frequently to print intrinsic reward diagnostics.",
+    )
+    parser.add_argument(
+        "--actor-workers",
+        type=int,
+        default=2,
+        help="Number of parallel actor threads to use for experience collection.",
+    )
+    parser.add_argument(
+        "--wandb-publish-interval",
+        type=int,
+        default=1,
+        help="Minimum step gap between successive W&B uploads (0 disables throttling).",
+    )
+    parser.add_argument(
+        "--video-step-interval",
+        type=int,
+        default=250,
+        help="Minimum environment step gap between successive W&B video uploads (0 disables throttling).",
+    )
+    parser.add_argument(
+        "--video-frame-stride",
+        type=int,
+        default=2,
+        help="Retain every Nth frame when constructing episode videos (1 keeps all frames).",
+    )
+    parser.add_argument(
+        "--video-max-frames",
+        type=int,
+        default=240,
+        help="Maximum number of frames kept after striding for a single uploaded video.",
+    )
+    parser.add_argument(
+        "--wandb-log-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds to wait for an individual W&B logging job before timing out.",
+    )
+    args = parser.parse_args()
+
+    raw_cfg = OmegaConf.load(args.config)
+    if args.override:
+        raw_cfg = OmegaConf.merge(raw_cfg, OmegaConf.from_dotlist(list(args.override)))
+
+    config = load_training_config(args.config, overrides=args.override)
+    if args.device:
+        config.device = args.device
+        raw_cfg.device = args.device
+
+    if xm and config.device == "xla":
+        runtime_device = xm.xla_device()
+    else:
+        runtime_device = torch.device(config.device)
+
+    import faiss
+
+    faiss.omp_set_num_threads(1)
+    dummy_index = faiss.IndexFlatL2(64)
+    dummy_vec = np.random.randn(1, 64).astype("float32")
+    dummy_index.add(dummy_vec)
+    del dummy_index, dummy_vec
+    print("[FAISS] Pre-initialized in main thread")
+
+    wandb.init(
+        project="dtc-agent-crafter",
+        config=OmegaConf.to_container(raw_cfg, resolve=True),
+        name=f"crafter_seed{args.seed}",
+    )
+    wandb.define_metric("step/total_steps", summary="max")
+    wandb.define_metric("step/*", step_metric="step/total_steps")
+    wandb.define_metric("train/*", step_metric="step/total_steps")
+    wandb.define_metric("dream/*", step_metric="step/total_steps")
+
+    loop = TrainingLoop(config)
+    num_workers = max(1, args.actor_workers)
+    stop_event = threading.Event()
+    steps_lock = threading.Lock()
+    shared_state: Dict[str, int] = {"steps": 0, "episodes": 0, "last_video_step": 0}
+    metrics_queue: Queue = Queue()
+
+    actor_threads = []
+    video_step_interval = max(0, args.video_step_interval)
+    for worker_id in range(num_workers):
+        worker_seed = args.seed + worker_id
+        thread = threading.Thread(
+            target=_actor_loop,
+            args=(
+                worker_id,
+                loop,
+                config,
+                runtime_device,
+                args.max_steps,
+                args.log_interval,
+                video_step_interval,
+                steps_lock,
+                shared_state,
+                stop_event,
+                metrics_queue,
+                worker_seed,
+            ),
+            daemon=True,
+        )
+        thread.start()
+        actor_threads.append(thread)
+
+    logger = WandBLogger(
+        max_pending_steps=10000,
+        publish_interval=max(0, args.wandb_publish_interval),
+        video_frame_stride=max(1, args.video_frame_stride),
+        video_max_frames=max(1, args.video_max_frames),
+        log_timeout=max(1.0, args.wandb_log_timeout),
+    )
+    flush_interval = 50
+    last_flush_step = -flush_interval
+    current_step = 0
+    try:
+        while True:
+            processed = logger.process_queue(metrics_queue)
+
+            with steps_lock:
+                current_step = shared_state["steps"]
+            
+            should_log_optimization = (current_step % args.log_interval == 0)
+            optimize_result = loop._optimize(log_metrics=should_log_optimization)
+
+            if optimize_result:
+                step_index, training_metrics = optimize_result
+                training_metrics.setdefault(
+                    "train/optimization_step", float(step_index)
+                )
+                logger.add_training_metrics(training_metrics, target_step=current_step)
+                processed = True
+
+            flush_due = current_step - last_flush_step >= flush_interval
+            should_flush = flush_due or (
+                optimize_result and logger.has_pending()
+            )
+            if should_flush:
+                if logger.flush_pending():
+                    processed = True
+                last_flush_step = current_step
+
+            with steps_lock:
+                current_step = shared_state["steps"]
+            should_log_optimization = (current_step % args.log_interval == 0)
+            optimize_result = loop._optimize(log_metrics=should_log_optimization)
+            if optimize_result:
+                step_index, training_metrics = optimize_result
+                training_metrics.setdefault(
+                    "train/optimization_step", float(step_index)
+                )
+                with steps_lock:
+                    current_step = shared_state["steps"]
+                logger.add_training_metrics(training_metrics, target_step=current_step)
+                if current_step - last_flush_step >= flush_interval:
+                    if logger.flush_pending():
+                        processed = True
+                    last_flush_step = current_step
+
+            if (
+                stop_event.is_set()
+                and all(not thread.is_alive() for thread in actor_threads)
+                and metrics_queue.empty()
+            ):
+                if logger.flush_pending():
+                    processed = True
+                    with steps_lock:
+                        current_step = shared_state["steps"]
+                    last_flush_step = current_step
+                if not logger.has_pending():
+                    break
+
+            if not processed:
+                time.sleep(0.001)
+    finally:
+        stop_event.set()
+        for thread in actor_threads:
+            thread.join()
+        logger.close()
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    main()
+
+
+

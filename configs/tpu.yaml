@@ -1,0 +1,25 @@
+# TPU-Optimized Configuration
+# Extends default.yaml with XLA-specific settings
+
+defaults:
+  - default
+
+device: xla
+
+# TPU v3-8 has 8 cores, usually 16GB HBM each.
+# We can increase batch size significantly compared to GPU.
+batch_size: 128  # Per core batch size (Total effective = 128 * 8 = 1024)
+
+# Disable compilation for dynamic shapes if needed, but XLA compiles by default.
+# This flag in loop.py controls torch.compile, which we want OFF for XLA.
+compile_modules: false
+
+# World Model
+world_model_ensemble: 5
+
+# Memory
+episodic_memory:
+  capacity: 10000
+
+# Optimization
+optimizer_lr: 0.0003 # Slightly lower LR for larger effective batch size
