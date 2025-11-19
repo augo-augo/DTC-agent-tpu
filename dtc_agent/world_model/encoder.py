@@ -145,6 +145,38 @@ class _SlotAttention(nn.Module):
         if inputs.shape[1] <= 0:
             raise ValueError("Slot Attention requires at least one input token")
 
+        b, n, d = inputs.shape
+        inputs = self.norm_inputs(inputs)
+
+        mu = self.slot_mu.expand(b, self.num_slots, -1)
+        sigma = F.softplus(self.slot_sigma).clamp(min=0.1, max=2.0)
+        slots = mu + sigma * torch.randn_like(mu)
+
+        k = self.project_k(inputs)
+        v = self.project_v(inputs)
+
+        for _ in range(self.iters):
+            slots_prev = slots
+            slots = self.norm_slots(slots)
+            q = self.project_q(slots)
+
+            dots = torch.bmm(k, q.transpose(1, 2)) * (d ** -0.5)
+            attn = F.softmax(dots, dim=1)
+
+            updates = torch.bmm(attn.transpose(1, 2), v)
+            slots = self.gru(
+                updates.reshape(-1, d),
+                slots_prev.reshape(-1, d)
+            ).reshape(b, self.num_slots, d)
+            slots = slots + self.mlp(self.norm_mlp(slots))
+
+        return slots
+
+
+class SlotAttentionEncoder(nn.Module):
+    """Encoder that uses Slot Attention to decompose observations into object slots."""
+
+    def __init__(self, config: EncoderConfig) -> None:
         """Initialize the encoder components described by ``config``.
 
         Args:
