@@ -16,7 +16,7 @@ from dtc_agent.agents import (
 )
 from dtc_agent.cognition import WorkspaceConfig, WorkspaceRouter
 from dtc_agent.cognition.temporal_self import TemporalSelfConfig, TemporalSelfModule
-from dtc_agent.memory import EpisodicBuffer, EpisodicBufferConfig, EpisodicSnapshot
+from dtc_agent.memory import EpisodicBuffer, EpisodicBufferConfig, EpisodicSnapshot, create_episodic_buffer
 from dtc_agent.motivation import (
     EmpowermentConfig,
     IntrinsicRewardConfig,
@@ -24,7 +24,14 @@ from dtc_agent.motivation import (
     InfoNCEEmpowermentEstimator,
     estimate_observation_entropy,
 )
-from dtc_agent.utils import sanitize_gradients, sanitize_tensor
+from dtc_agent.utils import (
+    sanitize_gradients,
+    sanitize_tensor,
+    set_threading_enabled,
+    get_lock,
+    set_xla_mode,
+    xla_print,
+)
 from dtc_agent.world_model import (
     DecoderConfig,
     DynamicsConfig,
@@ -313,8 +320,16 @@ class TrainingLoop:
         self.config = config
         if xm:
             self.device = xm.xla_device()
+            # Disable threading on TPU for Colab compatibility
+            set_threading_enabled(False)
+            # Enable XLA-safe logging to avoid graph breaks
+            set_xla_mode(True)
         else:
             self.device = torch.device(config.device)
+            # Check if device is XLA-based (string check for safety)
+            if 'xla' in str(config.device).lower():
+                set_threading_enabled(False)
+                set_xla_mode(True)
         _configure_tf32_precision(self.device)
         self.progress_momentum = config.workspace.progress_momentum
         self.action_cost_scale = config.workspace.action_cost_scale
@@ -328,7 +343,8 @@ class TrainingLoop:
         world_model = WorldModelEnsemble(wm_config).to(self.device)
         self.world_model = world_model
         self.workspace = WorkspaceRouter(config.workspace)
-        self.memory = EpisodicBuffer(config.episodic_memory)
+        # Use factory function to automatically select FAISS or TPU-compatible implementation
+        self.memory = create_episodic_buffer(config.episodic_memory, device=self.device)
         empowerment = InfoNCEEmpowermentEstimator(config.empowerment).to(self.device)
         self.empowerment = empowerment
         self.reward = IntrinsicRewardGenerator(
@@ -392,7 +408,8 @@ class TrainingLoop:
         self._step_count: int = 0
         self._novelty_trace: torch.Tensor | None = None
         self._latest_self_state: torch.Tensor | None = None
-        self._step_lock = threading.Lock()
+        # Use threading-compatible lock (no-op on TPU)
+        self._step_lock = get_lock()
         self._policy_snapshot_interval = max(1, config.policy_snapshot_interval)
         self._last_snapshot_sync = 0
 
@@ -891,7 +908,7 @@ class TrainingLoop:
         if hasattr(self.empowerment, "temperature"):
             temperature = getattr(self.empowerment, "temperature")
             if isinstance(temperature, torch.Tensor) and not torch.isfinite(temperature).all():
-                print(f"[STEP {self._step_count}] 🚨 EMERGENCY: Resetting empowerment temperature")
+                xla_print(f"[STEP {self._step_count}] 🚨 EMERGENCY: Resetting empowerment temperature")
                 with torch.no_grad():
                     temperature.copy_(
                         torch.tensor(
@@ -906,7 +923,7 @@ class TrainingLoop:
         if decoder is not None and hasattr(decoder, "log_std"):
             log_std = getattr(decoder, "log_std")
             if isinstance(log_std, torch.Tensor) and not torch.isfinite(log_std).all():
-                print(f"[STEP {self._step_count}] 🚨 EMERGENCY: Resetting decoder log_std")
+                xla_print(f"[STEP {self._step_count}] 🚨 EMERGENCY: Resetting decoder log_std")
                 with torch.no_grad():
                     log_std.copy_(
                         torch.full_like(log_std, self.config.decoder.init_log_std)
@@ -937,9 +954,9 @@ class TrainingLoop:
                         corrupted.append(f"{prefix}.{name}")
 
         if corrupted:
-            print(f"[STEP {self._step_count}] 🚨 CORRUPTED PARAMETERS:")
+            xla_print(f"[STEP {self._step_count}] 🚨 CORRUPTED PARAMETERS:")
             for name in corrupted:
-                print(f"  - {name}")
+                xla_print(f"  - {name}")
             return False
         return True
 
@@ -969,11 +986,11 @@ class TrainingLoop:
             return None
 
         if self._emergency_reset_if_corrupted():
-            print("[TRAINING] Parameters were corrupted and reset, skipping this update")
+            xla_print("[TRAINING] Parameters were corrupted and reset, skipping this update")
             return None
 
         if not self._check_parameter_health():
-            print("[TRAINING] Skipping update due to corrupted parameters")
+            xla_print("[TRAINING] Skipping update due to corrupted parameters")
             return None
         temporal_context = self.current_temporal_state
         if temporal_context is None:
@@ -1015,7 +1032,7 @@ class TrainingLoop:
 
                 for key, tensor in latents.items():
                     if isinstance(tensor, torch.Tensor) and not torch.isfinite(tensor).all():
-                        print(
+                        xla_print(
                             f"[STEP {self._step_count}] NaN in {key} from encoder! Skipping update."
                         )
                         return None
@@ -1099,7 +1116,7 @@ class TrainingLoop:
                 if hasattr(self.empowerment, "get_queue_diagnostics"):
                     emp_diag = self.empowerment.get_queue_diagnostics()
                     if self._step_count % 1000 == 0:
-                        print(
+                        xla_print(
                             f"[Empowerment Queue] Size: {emp_diag['queue_size']}, "
                             f"Diversity: {emp_diag['queue_diversity']:.4f}"
                         )
@@ -1123,8 +1140,8 @@ class TrainingLoop:
 
             for name, loss_val in loss_components.items():
                 if not torch.isfinite(loss_val):
-                    print(f"[STEP {self._step_count}] WARNING: Non-finite {name}_loss: {loss_val}")
-                    print("  Skipping optimization step to prevent parameter corruption")
+                    xla_print(f"[STEP {self._step_count}] WARNING: Non-finite {name}_loss: {loss_val}")
+                    xla_print("  Skipping optimization step to prevent parameter corruption")
                     if self._step_count % 1000 == 0:
                         torch.save(
                             {
@@ -1141,7 +1158,7 @@ class TrainingLoop:
                             if torch.isfinite(debug_val)
                             else "NaN/Inf"
                         )
-                        print(f"    {debug_name}: {val_str}")
+                        xla_print(f"    {debug_name}: {val_str}")
                     return None
 
             self.grad_scaler.scale(total_loss).backward()
@@ -1155,7 +1172,7 @@ class TrainingLoop:
             bad_grads += sanitize_gradients(self.critic)
             bad_grads += sanitize_gradients(self.empowerment)
             if bad_grads > 0:
-                print(f"[STEP {self._step_count}] WARNING: Sanitized {bad_grads} non-finite gradients")
+                xla_print(f"[STEP {self._step_count}] WARNING: Sanitized {bad_grads} non-finite gradients")
 
             if xm:
                 xm.optimizer_step(self.optimizer)
@@ -1175,7 +1192,7 @@ class TrainingLoop:
             if self._step_count > 0 and self._step_count % 1000 == 0:
                 self.world_model.refresh_frozen_decoder()
                 if self._step_count % 5000 == 0:
-                    print(f"[Step {self._step_count}] Refreshed frozen decoder")
+                    xla_print(f"[Step {self._step_count}] Refreshed frozen decoder")
 
             if not log_metrics:
                 return self._step_count, {}
@@ -1209,7 +1226,7 @@ class TrainingLoop:
                     metrics[key] = float(value)
             return self._step_count, metrics
         except Exception as e:
-            print(f"[STEP {self._step_count}] Error during optimization: {e}")
+            xla_print(f"[STEP {self._step_count}] Error during optimization: {e}")
             return None
 
     def _stable_dreaming(
@@ -1390,7 +1407,7 @@ class TrainingLoop:
                     dream_novelty_values.append(float(novelty.detach().mean().item()))
 
                     if not torch.isfinite(novelty).all() or not torch.isfinite(observation_entropy).all():
-                        print(
+                        xla_print(
                             f"[DREAM ERROR at step {self._step_count}] Non-finite dream values detected, skipping this dream chunk"
                         )
                         return (
@@ -1587,40 +1604,40 @@ class TrainingLoop:
         }
 
         if self._step_count % 100 == 0:
-            print(f"\n[Dream Diagnostic at step {self._step_count}]")
-            print(
+            xla_print(f"\n[Dream Diagnostic at step {self._step_count}]")
+            xla_print(
                 f"  Rewards: mean={rewards_tensor.mean():.4f}, std={rewards_tensor.std():.6f}, min={rewards_tensor.min():.4f}, max={rewards_tensor.max():.4f}"
             )
             if dream_actions:
                 action_norms = torch.stack([a.norm(dim=-1).mean() for a in dream_actions])
-                print(
+                xla_print(
                     f"  Actions: mean_norm={action_norms.mean():.4f}, std={action_norms.std():.6f}"
                 )
-                print(
+                xla_print(
                     f"  Action divergence: mean={divergence_values.mean().item():.4f}, std={divergence_values.std(unbiased=False).item():.6f}"
                 )
-                print(
+                xla_print(
                     f"  Counterfactual rate: {counterfactual_tensor.mean().item():.4f}"
                 )
-                print(
+                xla_print(
                     f"  Latent drift norm: {latent_drift_tensor.mean().item():.6f}"
                 )
-            print(
+            xla_print(
                 f"  Policy entropy: mean={entropies_tensor.mean():.4f}, std={entropies_tensor.std():.6f}"
             )
             if len(competence_terms) > 0:
                 comp_tensor = torch.stack(competence_terms)
-                print(
+                xla_print(
                     f"  Competence: mean={comp_tensor.mean():.4f}, std={comp_tensor.std():.6f}"
                 )
             if len(survival_terms) > 0:
                 survival_tensor = torch.stack(survival_terms)
-                print(
+                xla_print(
                     f"  Survival: mean={survival_tensor.mean():.4f}, std={survival_tensor.std():.6f}"
                 )
             if len(explore_terms) > 0:
                 explore_tensor = torch.stack(explore_terms)
-                print(
+                xla_print(
                     f"  Explore: mean={explore_tensor.mean():.4f}, std={explore_tensor.std():.6f}"
                 )
 

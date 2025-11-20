@@ -1,0 +1,28 @@
+# Core dependencies for Colab TPU environment
+# Install with: pip install -r requirements-colab.txt
+
+# TPU support
+torch>=2.5.1
+torch-xla[tpu]>=2.5.1
+
+# Core dependencies
+numpy>=1.26,<2
+einops>=0.7
+tqdm>=4.66
+omegaconf>=2.3
+
+# W&B for experiment tracking (optional but recommended)
+wandb[media]>=0.17
+
+# RL environments
+gymnasium>=0.29
+crafter>=1.8.0
+
+# Note: FAISS is CPU-only and not TPU-compatible
+# Using PyTorch-based alternative for episodic memory on TPU
+# faiss-cpu>=1.7.4  # Disabled for TPU compatibility
+
+# Visualization (for Colab notebooks)
+matplotlib>=3.7
+imageio>=2.31
+pillow>=10.0

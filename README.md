@@ -1,11 +1,15 @@
 # DTC: An Intrinsically Motivated Agent for Emergent Curriculum Learning
 
-**Author:** augo-augo (Independent Researcher)  
+**Author:** augo-augo (Independent Researcher)
 **Version:** 3.0 (November 2025)
 
 [![Paper](https://img.shields.io/badge/arXiv-Coming%20Soon-b31b1b.svg)](https://arxiv.org)
 [![Code](https://img.shields.io/badge/GitHub-DTC--agent-blue.svg)](https://github.com/augo-augo/DTC-agent)
 [![Training Logs](https://img.shields.io/badge/W%26B-Training%20Logs-orange.svg)](https://wandb.ai/bsingleton-art-scgwt/scgwt-crafter/runs/5dz500gm?nw=nwuserbsingletonart)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/augo-augo/DTC-agent-tpu/blob/main/DTC_TPU_Colab.ipynb)
+
+> **🚀 NEW: TPU Support!** This repository now includes full Google Cloud TPU support for faster training in Google Colab.
+> **See [README_TPU.md](README_TPU.md) for TPU setup and usage guide.**
 
 ---
 

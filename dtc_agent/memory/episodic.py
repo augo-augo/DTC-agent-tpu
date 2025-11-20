@@ -7,7 +7,13 @@ import threading
 
 import numpy as np
 import torch
-import faiss
+
+# FAISS is optional - falls back to TPU-compatible implementation
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except ImportError:
+    FAISS_AVAILABLE = False
 
 
 @dataclass
@@ -233,6 +239,8 @@ class EpisodicBuffer:
 
     def _rebuild_index_locked(self) -> None:
         """Rebuild the FAISS index from currently stored keys."""
+        if not FAISS_AVAILABLE:
+            raise RuntimeError("FAISS is not available")
 
         new_index = faiss.IndexFlatL2(self.config.key_dim)
         if self.values:
@@ -241,7 +249,7 @@ class EpisodicBuffer:
             key_stack = torch.stack([self.values[idx].key for idx in sorted_ids])
             key_np = np.ascontiguousarray(key_stack.numpy(), dtype=np.float32)
             new_index.add(key_np)
-            
+
             # CRITICAL: We must re-map the IDs in self.values to match the new index (0..N-1)
             # Otherwise, the new index returns 0..N-1, but self.values has old large IDs.
             new_values = {}
@@ -249,5 +257,41 @@ class EpisodicBuffer:
                 new_values[new_id] = self.values[old_id]
             self.values = new_values
             self.next_id = len(self.values)
-            
+
         self._cpu_index = new_index
+
+
+def create_episodic_buffer(
+    config: EpisodicBufferConfig,
+    device: torch.device | None = None,
+    force_tpu: bool = False
+) -> "EpisodicBuffer | EpisodicBufferTPU":
+    """Factory function to create the appropriate episodic buffer implementation.
+
+    Args:
+        config: Buffer configuration.
+        device: Device to store buffer on (relevant for TPU implementation).
+        force_tpu: If True, use TPU implementation even if FAISS is available.
+
+    Returns:
+        EpisodicBuffer (FAISS-based) or EpisodicBufferTPU (pure PyTorch).
+    """
+    # Detect TPU/XLA device
+    is_tpu = False
+    if device is not None:
+        device_str = str(device)
+        is_tpu = 'xla' in device_str.lower() or device_str.startswith('xla')
+
+    # Use TPU implementation if:
+    # 1. Explicitly requested via force_tpu
+    # 2. FAISS is not available
+    # 3. Device is a TPU/XLA device
+    use_tpu_impl = force_tpu or not FAISS_AVAILABLE or is_tpu
+
+    if use_tpu_impl:
+        from dtc_agent.memory.episodic_tpu import EpisodicBufferTPU
+        return EpisodicBufferTPU(config, device=device)
+    else:
+        if not FAISS_AVAILABLE:
+            raise RuntimeError("FAISS is not available and no TPU device detected")
+        return EpisodicBuffer(config)

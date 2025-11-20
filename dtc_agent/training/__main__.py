@@ -183,6 +183,21 @@ def _actor_loop(
             except RuntimeError:
                 device_index = 0
         torch.cuda.set_device(device_index)
+    # Initialize Crafter environment with Colab compatibility
+    # In Colab/headless mode, Crafter needs special initialization
+    try:
+        # Check if running in Colab
+        import google.colab
+        in_colab = True
+    except ImportError:
+        in_colab = False
+
+    # Set headless mode for Colab (no display)
+    import os
+    if in_colab or 'COLAB_GPU' in os.environ:
+        os.environ['SDL_VIDEODRIVER'] = 'dummy'
+        os.environ['MUJOCO_GL'] = 'osmesa'
+
     env = crafter.Env()
 
     try:
