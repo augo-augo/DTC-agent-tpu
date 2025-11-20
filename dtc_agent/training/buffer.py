@@ -3,9 +3,9 @@ from __future__ import annotations
 import random
 from collections import deque
 from typing import Deque
-import threading
 
 import torch
+from dtc_agent.utils import get_lock
 
 
 class RolloutBuffer:
@@ -27,7 +27,8 @@ class RolloutBuffer:
         self._storage: Deque[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]] = deque(
             maxlen=capacity
         )
-        self._lock = threading.Lock()
+        # Use threading-compatible lock (no-op on TPU/Colab)
+        self._lock = get_lock()
 
     def push(
         self,
