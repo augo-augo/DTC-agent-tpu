@@ -94,31 +94,6 @@ def module_state_dict(module: nn.Module) -> OrderedDict[str, torch.Tensor]:
     return module.state_dict()
 
 
-class _NullGradScaler:
-    __slots__ = ()
-
-    def scale(self, loss: torch.Tensor) -> torch.Tensor:
-        return loss
-
-    def unscale_(self, optimizer: torch.optim.Optimizer) -> None:  # pragma: no cover - parity with AMP API
-        return None
-
-    def step(self, optimizer: torch.optim.Optimizer) -> None:
-        optimizer.step()
-
-    def update(self) -> None:  # pragma: no cover - parity with AMP API
-        return None
-
-    def state_dict(self) -> dict[str, float]:
-        return {}
-
-    def load_state_dict(self, state_dict: dict[str, float]) -> None:  # pragma: no cover - parity with AMP API
-        return None
-
-
-def _configure_tf32_precision(device: torch.device) -> None:
-    """Configure TF32 behavior - No-op on TPU."""
-    pass
 
 
 
@@ -330,7 +305,6 @@ class TrainingLoop:
             if 'xla' in str(config.device).lower():
                 set_threading_enabled(False)
                 set_xla_mode(True)
-        _configure_tf32_precision(self.device)
         self.progress_momentum = config.workspace.progress_momentum
         self.action_cost_scale = config.workspace.action_cost_scale
         wm_config = WorldModelConfig(
@@ -426,12 +400,7 @@ class TrainingLoop:
             params.extend(self.self_state_predictor.parameters())
         self.optimizer = torch.optim.Adam(params, lr=config.optimizer_lr)
         self.optimizer_empowerment_weight = config.optimizer_empowerment_weight
-        self.autocast_enabled = False # XLA handles BF16 natively via env vars
-        self.grad_scaler = _NullGradScaler()
         self.novelty_tracker = RunningMeanStd(device=self.device)
-
-    def _autocast_ctx(self) -> ContextManager[None]:
-        return nullcontext()
 
     def _compute_horizon_multiplier(self, normalized_deficit: float) -> float:
         normalized = max(0.0, min(1.0, float(normalized_deficit)))
@@ -542,20 +511,8 @@ class TrainingLoop:
 
         try:
             with torch.no_grad():
-                with self._autocast_ctx():
-                    amp_ctx_disable = nullcontext()
-                    if self.autocast_enabled and self.device.type == "cuda":
-                        try:
-                            amp_ctx_disable = torch.amp.autocast(
-                                device_type=self.device.type, enabled=False
-                            )
-                        except AttributeError:  # pragma: no cover - legacy fallback
-                            from torch.cuda.amp import autocast as legacy_autocast
-
-                            amp_ctx_disable = legacy_autocast(enabled=False)
-                    with amp_ctx_disable:
-                        latents = self._call_with_fallback("world_model", observation, module_override=world_model)
-                    memory_context = self._get_memory_context(latents["z_self"])
+                latents = self._call_with_fallback("world_model", observation, module_override=world_model)
+                memory_context = self._get_memory_context(latents["z_self"])
                 if action is not None:
                     action_for_routing = action.to(self.device, non_blocking=True)
                 else:
@@ -728,12 +685,6 @@ class TrainingLoop:
             if self_state is not None
             else None
         )
-        if torch.cuda.is_available():
-            obs_cpu = obs_cpu.pin_memory()
-            act_cpu = act_cpu.pin_memory()
-            next_cpu = next_cpu.pin_memory()
-            if state_cpu is not None:
-                state_cpu = state_cpu.pin_memory()
 
         batch_items = obs_cpu.shape[0]
         for idx in range(batch_items):
@@ -761,9 +712,8 @@ class TrainingLoop:
             raise ValueError("latent snapshot and action batch sizes must match")
 
         with torch.no_grad():
-            with self._autocast_ctx():
-                next_obs = next_observation.to(self.device, non_blocking=True)
-                next_latents = self._call_with_fallback("world_model", next_obs, module_override=world_model)
+            next_obs = next_observation.to(self.device, non_blocking=True)
+            next_latents = self._call_with_fallback("world_model", next_obs, module_override=world_model)
         target_latent = next_latents["slots"].mean(dim=1)
         self._write_memory(snapshot, action=action, target_latent=target_latent)
 
@@ -1027,107 +977,106 @@ class TrainingLoop:
             emp_diag: dict[str, float] | None = None
             replay_loss_value: torch.Tensor | None = None
 
-            with self._autocast_ctx():
-                latents = self._call_with_fallback("world_model", observations)
+            latents = self._call_with_fallback("world_model", observations)
 
-                for key, tensor in latents.items():
-                    if isinstance(tensor, torch.Tensor) and not torch.isfinite(tensor).all():
-                        xla_print(
-                            f"[STEP {self._step_count}] NaN in {key} from encoder! Skipping update."
-                        )
-                        return None
-                memory_context = self._get_memory_context(latents["z_self"])
-                broadcast, _, _, _, _ = self._route_slots(
-                    latents["slots"],
-                    latents["z_self"],
-                    actions,
-                    self_states,
-                    update_stats=False,
-                    cognitive_mode=temporal_context.get("cognitive_mode", "LEARNING"),
-                )
-                latent_state = broadcast.mean(dim=1)
-                temporal_features = temporal_context.get("field_tensor")
-                if (
-                    temporal_features is None
-                    or temporal_features.size(0) != latents["z_self"].size(0)
-                ):
-                    temporal_features = torch.zeros(
-                        latents["z_self"].size(0),
-                        self.temporal_self.field_dim,
-                        device=self.device,
-                        dtype=latents["z_self"].dtype,
+            for key, tensor in latents.items():
+                if isinstance(tensor, torch.Tensor) and not torch.isfinite(tensor).all():
+                    xla_print(
+                        f"[STEP {self._step_count}] NaN in {key} from encoder! Skipping update."
                     )
-                else:
-                    temporal_features = temporal_features.to(
-                        device=self.device, dtype=latents["z_self"].dtype
+                    return None
+            memory_context = self._get_memory_context(latents["z_self"])
+            broadcast, _, _, _, _ = self._route_slots(
+                latents["slots"],
+                latents["z_self"],
+                actions,
+                self_states,
+                update_stats=False,
+                cognitive_mode=temporal_context.get("cognitive_mode", "LEARNING"),
+            )
+            latent_state = broadcast.mean(dim=1)
+            temporal_features = temporal_context.get("field_tensor")
+            if (
+                temporal_features is None
+                or temporal_features.size(0) != latents["z_self"].size(0)
+            ):
+                temporal_features = torch.zeros(
+                    latents["z_self"].size(0),
+                    self.temporal_self.field_dim,
+                    device=self.device,
+                    dtype=latents["z_self"].dtype,
+                )
+            else:
+                temporal_features = temporal_features.to(
+                    device=self.device, dtype=latents["z_self"].dtype
+                )
+            features = self._assemble_features(
+                latents["z_self"], broadcast, memory_context, temporal_features
+            )
+
+            predictions = self.world_model.predict_next_latents(latent_state, actions)
+            decoded = self.world_model.decode_predictions(
+                predictions,
+                use_frozen=False,
+                sample=self.world_model.training,
+            )
+            log_likelihoods = torch.stack(
+                [dist.log_prob(next_observations).mean() for dist in decoded]
+            )
+            frontier_loss = -log_likelihoods.mean()
+
+            encoded_next = self._call_with_fallback("world_model", next_observations)
+            mean_latents = torch.stack([pred.mean for pred in predictions], dim=0)
+            predicted_latent = mean_latents.mean(dim=0)
+            target_latent = encoded_next["slots"].mean(dim=1)
+            latent_alignment = torch.nn.functional.mse_loss(predicted_latent, target_latent)
+            frontier_loss = frontier_loss + 0.1 * latent_alignment
+
+            replay_loss = torch.tensor(0.0, device=self.device)
+            if replay_samples is not None:
+                replay_latent, replay_actions, replay_targets = replay_samples
+                replay_predictions = self.world_model.predict_next_latents(
+                    replay_latent, replay_actions
+                )
+                replay_mean = torch.stack(
+                    [dist.mean for dist in replay_predictions], dim=0
+                ).mean(dim=0)
+                replay_loss = torch.nn.functional.mse_loss(replay_mean, replay_targets)
+
+            replay_loss_value = replay_loss
+
+            if replay_samples is not None:
+                world_model_loss = 0.5 * (frontier_loss + replay_loss)
+            else:
+                world_model_loss = frontier_loss
+            world_model_loss = world_model_loss * self.config.world_model_coef
+
+            self_state_loss = torch.tensor(0.0, device=self.device)
+            if (
+                self_states is not None
+                and self.self_state_dim > 0
+                and self.self_state_predictor is not None
+            ):
+                z_self_float = latents["z_self"].float()
+                predicted_state = self.self_state_predictor(z_self_float)
+                self_state_loss = torch.nn.functional.mse_loss(predicted_state, self_states)
+                self_state_loss = self.config.workspace.self_bias * self_state_loss
+
+            if hasattr(self.empowerment, "get_queue_diagnostics"):
+                emp_diag = self.empowerment.get_queue_diagnostics()
+                if self._step_count % 1000 == 0:
+                    xla_print(
+                        f"[Empowerment Queue] Size: {emp_diag['queue_size']}, "
+                        f"Diversity: {emp_diag['queue_diversity']:.4f}"
                     )
-                features = self._assemble_features(
-                    latents["z_self"], broadcast, memory_context, temporal_features
-                )
 
-                predictions = self.world_model.predict_next_latents(latent_state, actions)
-                decoded = self.world_model.decode_predictions(
-                    predictions,
-                    use_frozen=False,
-                    sample=self.world_model.training,
-                )
-                log_likelihoods = torch.stack(
-                    [dist.log_prob(next_observations).mean() for dist in decoded]
-                )
-                frontier_loss = -log_likelihoods.mean()
-
-                encoded_next = self._call_with_fallback("world_model", next_observations)
-                mean_latents = torch.stack([pred.mean for pred in predictions], dim=0)
-                predicted_latent = mean_latents.mean(dim=0)
-                target_latent = encoded_next["slots"].mean(dim=1)
-                latent_alignment = torch.nn.functional.mse_loss(predicted_latent, target_latent)
-                frontier_loss = frontier_loss + 0.1 * latent_alignment
-
-                replay_loss = torch.tensor(0.0, device=self.device)
-                if replay_samples is not None:
-                    replay_latent, replay_actions, replay_targets = replay_samples
-                    replay_predictions = self.world_model.predict_next_latents(
-                        replay_latent, replay_actions
-                    )
-                    replay_mean = torch.stack(
-                        [dist.mean for dist in replay_predictions], dim=0
-                    ).mean(dim=0)
-                    replay_loss = torch.nn.functional.mse_loss(replay_mean, replay_targets)
-
-                replay_loss_value = replay_loss
-
-                if replay_samples is not None:
-                    world_model_loss = 0.5 * (frontier_loss + replay_loss)
-                else:
-                    world_model_loss = frontier_loss
-                world_model_loss = world_model_loss * self.config.world_model_coef
-
-                self_state_loss = torch.tensor(0.0, device=self.device)
-                if (
-                    self_states is not None
-                    and self.self_state_dim > 0
-                    and self.self_state_predictor is not None
-                ):
-                    z_self_float = latents["z_self"].float()
-                    predicted_state = self.self_state_predictor(z_self_float)
-                    self_state_loss = torch.nn.functional.mse_loss(predicted_state, self_states)
-                    self_state_loss = self.config.workspace.self_bias * self_state_loss
-
-                if hasattr(self.empowerment, "get_queue_diagnostics"):
-                    emp_diag = self.empowerment.get_queue_diagnostics()
-                    if self._step_count % 1000 == 0:
-                        xla_print(
-                            f"[Empowerment Queue] Size: {emp_diag['queue_size']}, "
-                            f"Diversity: {emp_diag['queue_diversity']:.4f}"
-                        )
-
-                real_stimulus_deficit = float(
-                    temporal_context.get("stimulus_deficit", 0.0)
-                )
-                dream_loss, actor_loss, critic_loss, dream_metrics = self._stable_dreaming(
-                    latents, real_stimulus_deficit
-                )
-                total_loss = world_model_loss + actor_loss + critic_loss + dream_loss + self_state_loss
+            real_stimulus_deficit = float(
+                temporal_context.get("stimulus_deficit", 0.0)
+            )
+            dream_loss, actor_loss, critic_loss, dream_metrics = self._stable_dreaming(
+                latents, real_stimulus_deficit
+            )
+            total_loss = world_model_loss + actor_loss + critic_loss + dream_loss + self_state_loss
 
             loss_components = {
                 "world_model": world_model_loss,
@@ -1161,8 +1110,7 @@ class TrainingLoop:
                         xla_print(f"    {debug_name}: {val_str}")
                     return None
 
-            self.grad_scaler.scale(total_loss).backward()
-            self.grad_scaler.unscale_(self.optimizer)
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), max_norm=1.0)
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
