@@ -14,8 +14,8 @@ authors = [
     { name = "SC-GWT Team" }
 ]
 dependencies = [
-    "torch>=2.5.1",
-    "numpy>=1.26,<2",
+    "torch>=2.0.0",          # Relaxed from 2.5.1
+    "numpy>=1.24",           # Relaxed
     "einops>=0.7",
     "tqdm>=4.66",
     "omegaconf>=2.3",
@@ -23,7 +23,7 @@ dependencies = [
     "gymnasium>=0.29",
     "minigrid>=2.3",
     "crafter>=1.8.0",
-    "faiss-cpu>=1.7.4"
+    # "faiss-cpu>=1.7.4"     # Removed: Make optional for TPU
 ]
 
 [project.optional-dependencies]

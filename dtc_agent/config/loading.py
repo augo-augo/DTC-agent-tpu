@@ -31,8 +31,30 @@ def load_training_config(path: str | Path, overrides: Iterable[str] | None = Non
         TypeError: If the root of the configuration is not a mapping.
         KeyError: If any required configuration section is missing.
     """
+    target_path = Path(path)
+    cfg = OmegaConf.load(target_path)
 
-    cfg = OmegaConf.load(Path(path))
+    # Handle Hydra-style defaults list for inheritance
+    if "defaults" in cfg:
+        defaults_list = cfg.pop("defaults")
+        base_cfg = OmegaConf.create({})
+
+        for item in defaults_list:
+            if isinstance(item, str):
+                defaults_name = item
+            elif isinstance(item, dict):
+                defaults_name = list(item.keys())[0]
+            else:
+                continue
+
+            base_file = target_path.parent / f"{defaults_name}.yaml"
+            if base_file.exists():
+                print(f"[Config] Merging base config: {base_file}")
+                loaded_base = OmegaConf.load(base_file)
+                base_cfg = OmegaConf.merge(base_cfg, loaded_base)
+
+        cfg = OmegaConf.merge(base_cfg, cfg)
+
     if overrides:
         override_conf = OmegaConf.from_dotlist(list(overrides))
         cfg = OmegaConf.merge(cfg, override_conf)

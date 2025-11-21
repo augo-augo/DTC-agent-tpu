@@ -534,14 +534,12 @@ def main() -> None:
     else:
         runtime_device = torch.device(config.device)
 
-    import faiss
-
-    faiss.omp_set_num_threads(1)
-    dummy_index = faiss.IndexFlatL2(64)
-    dummy_vec = np.random.randn(1, 64).astype("float32")
-    dummy_index.add(dummy_vec)
-    del dummy_index, dummy_vec
-    print("[FAISS] Pre-initialized in main thread")
+    try:
+        import faiss
+        faiss.omp_set_num_threads(1)
+        print("[FAISS] Pre-initialized in main thread")
+    except ImportError:
+        print("[FAISS] Not available (using TPU/PyTorch memory buffer)")
 
     wandb.init(
         project="dtc-agent-crafter",
