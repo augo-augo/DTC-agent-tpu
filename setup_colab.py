@@ -58,6 +58,7 @@ def setup_colab_tpu() -> bool:
         import torch
         import torch_xla
         import torch_xla.core.xla_model as xm
+        import torch_xla.runtime as xr
 
         device = xm.xla_device()
         print(f"TPU device available: {device}")
@@ -68,7 +69,7 @@ def setup_colab_tpu() -> bool:
         print("TPU test operation successful")
 
         # Get TPU configuration
-        num_devices = xm.xrt_world_size()
+        num_devices = xr.world_size()
         print(f"Number of TPU cores: {num_devices}")
 
     except Exception as e:

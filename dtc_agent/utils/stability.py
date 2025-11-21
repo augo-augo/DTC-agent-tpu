@@ -46,8 +46,6 @@ def sanitize_tensor(x: torch.Tensor, replacement: float = 0.0) -> torch.Tensor:
         Tensor with the same shape as ``x`` containing only finite values.
     """
     mask = torch.isfinite(x)
-    if bool(mask.all()):
-        return x
     return torch.where(mask, x, torch.full_like(x, replacement))
 
 
