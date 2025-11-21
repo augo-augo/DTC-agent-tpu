@@ -160,14 +160,16 @@ class _SlotAttention(nn.Module):
             slots = self.norm_slots(slots)
             q = self.project_q(slots)
 
-            dots = torch.bmm(k, q.transpose(1, 2)) * (d ** -0.5)
-            attn = F.softmax(dots, dim=1)
+            # TPU OPTIMIZATION: Vectorized Matrix Multiplication
+            attn_logits = torch.matmul(k, q.transpose(1, 2)) * (d ** -0.5)
+            attn = F.softmax(attn_logits, dim=1) + self.epsilon
+            attn = attn / attn.sum(dim=-1, keepdim=True)
 
-            updates = torch.bmm(attn.transpose(1, 2), v)
-            slots = self.gru(
-                updates.reshape(-1, d),
-                slots_prev.reshape(-1, d)
-            ).reshape(b, self.num_slots, d)
+            updates = torch.matmul(attn.transpose(1, 2), v)
+
+            # Reshape updates to match GRU expectation
+            slots = self.gru(updates.reshape(-1, d), slots_prev.reshape(-1, d))
+            slots = slots.reshape(b, self.num_slots, d)
             slots = slots + self.mlp(self.norm_mlp(slots))
 
         return slots
