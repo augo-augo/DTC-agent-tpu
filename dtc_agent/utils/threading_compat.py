@@ -4,6 +4,8 @@ This module provides thread-safe wrappers that can be disabled for
 environments where threading is problematic (e.g., Google Colab TPU).
 """
 
+from __future__ import annotations
+
 import threading
 from contextlib import contextmanager
 from typing import Any
