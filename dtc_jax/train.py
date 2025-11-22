@@ -21,6 +21,7 @@ from pathlib import Path
 from dtc_jax.configs.base_config import DTCConfig
 from dtc_jax.dtc import trainer
 from dtc_jax.dtc import collector
+from dtc_jax.dtc import jax_env
 
 
 def main():
@@ -36,12 +37,20 @@ def main():
 
     # ===== Initialize Configuration =====
     config = DTCConfig()
+    env_info = jax_env.get_env_info()
+
     print(f"Configuration loaded:")
     print(f"  - Global batch size: {config.global_batch_size}")
     print(f"  - Local batch size: {config.local_batch_size}")
     print(f"  - TPU cores: {config.num_tpu_cores}")
     print(f"  - Ensemble size: {config.ensemble_size}")
     print(f"  - Max dream horizon: {config.max_dream_horizon}")
+    print(f"\nEnvironment specifications:")
+    print(f"  - Environment: {env_info['name']}")
+    print(f"  - Observation dim: {env_info['observation_dim']}")
+    print(f"  - Action dim: {env_info['action_dim']}")
+    print(f"  - Grid size: {env_info['grid_size']}×{env_info['grid_size']}")
+    print(f"  - Max episode steps: {env_info['max_episode_steps']}")
 
     # ===== Check Available Devices =====
     devices = jax.devices()
@@ -78,13 +87,15 @@ def main():
     pmapped_train_step = trainer.create_train_fn(config)
     print(f"✓ Training function created")
 
-    # ===== Create Environment Functions (Dummy for now) =====
-    print(f"\nInitializing environment...")
+    # ===== Create JAX-Native Environment Functions =====
+    print(f"\nInitializing JAX-native environment...")
     key, env_key = random.split(key)
-    env_reset_fn, env_step_fn = collector.create_dummy_env_fns(config)
+    env_reset_fn, env_step_fn = collector.create_jax_env_fns(config)
     env_state, _ = env_reset_fn(env_key)
-    print(f"✓ Environment initialized (dummy)")
-    print(f"  ⚠️  Replace with real JAX environment for production")
+    print(f"✓ JAX-native environment initialized")
+    print(f"  ✓ Zero CPU-TPU transfer (fully JAX-native)")
+    print(f"  ✓ Shape invariance enforced")
+    print(f"  ✓ Precision firewall active (bfloat16/float32)")
 
     # ===== Training Loop =====
     print(f"\n{'='*60}")

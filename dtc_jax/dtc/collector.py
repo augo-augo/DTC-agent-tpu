@@ -21,6 +21,7 @@ from dtc_jax.dtc import rssm as rssm_module
 from dtc_jax.dtc import intrinsic as intrinsic_module
 from dtc_jax.dtc import memory as memory_module
 from dtc_jax.dtc import actor_critic as ac_module
+from dtc_jax.dtc import jax_env  # JAX-native environment
 
 
 def collect_experience_step(
@@ -230,15 +231,136 @@ def collect_episode(
 
 
 # ============================================================================
-# Dummy Environment (for testing only)
+# JAX-Native Environment Integration ("The Feeder")
+# ============================================================================
+
+def create_jax_env_fns(config: DTCConfig):
+    """
+    Create JAX-native environment functions.
+
+    This replaces the DummyEnv with a fully JAX-native grid world that:
+    - Runs entirely on TPU (zero CPU-TPU transfer)
+    - Maintains shape invariance (fixed tensor shapes)
+    - Uses precision firewall (bfloat16/float32)
+    - Follows RNG contract (key in, key out)
+
+    Returns:
+        reset_fn: Function (key) -> (env_state, obs)
+        step_fn: Function (env_state, action) -> (new_env_state, obs, reward, done)
+    """
+    # Get environment info
+    env_info = jax_env.get_env_info()
+
+    # Validate that environment dimensions match config
+    if config.obs_dim != env_info['observation_dim']:
+        raise ValueError(
+            f"Config obs_dim ({config.obs_dim}) doesn't match "
+            f"environment obs_dim ({env_info['observation_dim']}). "
+            f"Update config.obs_dim to {env_info['observation_dim']}."
+        )
+
+    if config.action_dim != env_info['action_dim']:
+        raise ValueError(
+            f"Config action_dim ({config.action_dim}) doesn't match "
+            f"environment action_dim ({env_info['action_dim']}). "
+            f"Update config.action_dim to {env_info['action_dim']}."
+        )
+
+    def reset_fn(key: chex.PRNGKey) -> Tuple[Any, chex.Array]:
+        """
+        Reset environment.
+
+        Args:
+            key: PRNG key
+
+        Returns:
+            env_state: Environment state (jax_env.EnvState with embedded key)
+            obs: Initial observation [batch_size, obs_dim]
+        """
+        # Reset single environment
+        key, env_state = jax_env.reset(key)
+
+        # Extract observation
+        obs_single = jax_env.state_to_observation(env_state)
+
+        # Broadcast to batch size (all agents start in same env for simplicity)
+        obs_batch = jnp.stack([obs_single] * config.local_batch_size)
+
+        # Return state with embedded key for future steps
+        state_with_key = (key, env_state)
+
+        return state_with_key, obs_batch
+
+    def step_fn(
+        state_with_key: Tuple[chex.PRNGKey, Any],
+        action: chex.Array
+    ) -> Tuple[Any, chex.Array, chex.Array, chex.Array]:
+        """
+        Step environment.
+
+        Args:
+            state_with_key: Tuple of (key, env_state)
+            action: Batched actions [batch_size, action_dim]
+
+        Returns:
+            new_state_with_key: Updated (key, env_state)
+            obs: Observations [batch_size, obs_dim]
+            reward: Rewards [batch_size]
+            done: Done flags [batch_size]
+        """
+        key, env_state = state_with_key
+
+        # Convert continuous actions to discrete (for grid world)
+        # Map continuous [-1, 1] to discrete actions [0, NUM_ACTIONS-1]
+        # Take first action in batch (single environment for now)
+        action_continuous = action[0] if action.ndim > 1 else action
+
+        # Discretize: [up, down, left, right, collect]
+        # Simple mapping: use action dimensions to determine discrete action
+        if config.action_dim >= env_info['action_dim']:
+            # Take argmax of first NUM_ACTIONS dimensions
+            action_discrete = jnp.argmax(action_continuous[:env_info['action_dim']])
+        else:
+            # Random action if dimensionality mismatch
+            key, action_key = random.split(key)
+            action_discrete = random.randint(
+                action_key, (), 0, env_info['action_dim']
+            )
+
+        # Step environment (RNG contract: key in, key out)
+        key, new_env_state, reward, done = jax_env.step(
+            env_state, action_discrete, key
+        )
+
+        # Extract observation
+        obs_single = jax_env.state_to_observation(new_env_state)
+
+        # Broadcast to batch size
+        obs_batch = jnp.stack([obs_single] * config.local_batch_size)
+        reward_batch = jnp.array([reward] * config.local_batch_size, dtype=jnp.float32)
+        done_batch = jnp.array([done] * config.local_batch_size, dtype=bool)
+
+        # Return updated state
+        new_state_with_key = (key, new_env_state)
+
+        return new_state_with_key, obs_batch, reward_batch, done_batch
+
+    # JIT compile for maximum performance
+    reset_fn_jit = jax.jit(reset_fn)
+    step_fn_jit = jax.jit(step_fn)
+
+    return reset_fn_jit, step_fn_jit
+
+
+# ============================================================================
+# Dummy Environment (DEPRECATED - kept for backward compatibility)
 # ============================================================================
 
 class DummyEnv:
     """
-    Simple dummy environment for testing the pipeline.
+    DEPRECATED: Simple dummy environment for testing the pipeline.
 
-    Replace this with a real JAX environment (Jumanji, Brax, etc.) or
-    implement your environment in JAX for maximum TPU performance.
+    Use create_jax_env_fns() instead for JAX-native TPU performance.
     """
 
     def __init__(self, obs_dim: int = 64, action_dim: int = 8):
@@ -285,7 +407,9 @@ class DummyEnv:
 
 def create_dummy_env_fns(config: DTCConfig):
     """
-    Create dummy environment functions for testing.
+    DEPRECATED: Create dummy environment functions for testing.
+
+    Use create_jax_env_fns() instead.
 
     Returns:
         reset_fn: Function () -> (state, obs)

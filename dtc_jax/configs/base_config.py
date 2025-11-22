@@ -15,8 +15,9 @@ class DTCConfig:
     """Static configuration for DTC 3.0 JAX/TPU implementation."""
 
     # ===== Environment Settings =====
-    obs_dim: int = 64  # Observation dimension (adjust per environment)
-    action_dim: int = 8  # Action dimension (adjust per environment)
+    # JAX-native grid world: 16×16 grid + 8 inventory + 2 position = 266
+    obs_dim: int = 266  # Observation dimension (JAX GridWorld)
+    action_dim: int = 5  # Action dimension (up, down, left, right, collect)
 
     # ===== Training Settings =====
     global_batch_size: int = 256  # Must be divisible by TPU core count (e.g., 8)
