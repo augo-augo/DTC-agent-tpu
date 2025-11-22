@@ -70,6 +70,22 @@ class RSSMCell(nn.Module):
             name='obs_encoder'
         )
 
+        # Reward predictor: p(r_t | h_t, z_t)
+        # Predicts extrinsic reward from full state
+        self.reward_predictor = self._make_mlp(
+            hidden_dims=[self.config.hidden_dim],
+            output_dim=1,  # Scalar reward
+            name='reward_predictor'
+        )
+
+        # Continue predictor: p(continue_t | h_t, z_t)
+        # Predicts whether episode continues (1 - done)
+        self.continue_predictor = self._make_mlp(
+            hidden_dims=[self.config.hidden_dim],
+            output_dim=1,  # Scalar logit (sigmoid for probability)
+            name='continue_predictor'
+        )
+
     def _make_mlp(self, hidden_dims: list, output_dim: int, name: str) -> nn.Sequential:
         """Create MLP with ELU activations."""
         layers = []
@@ -189,6 +205,14 @@ class RSSMCell(nn.Module):
         state_concat = jnp.concatenate([new_deterministic, new_stochastic], axis=-1)
         reconstructed_obs = self.decoder(state_concat)
 
+        # ===== Predict Reward and Continue =====
+        # Reward prediction: scalar extrinsic reward
+        predicted_reward = self.reward_predictor(state_concat).squeeze(-1)  # [batch]
+
+        # Continue prediction: probability that episode continues (1 - done)
+        continue_logit = self.continue_predictor(state_concat).squeeze(-1)  # [batch]
+        continue_prob = jax.nn.sigmoid(continue_logit)
+
         # ===== Collect Info for Loss Computation =====
         info = {
             'prior_mean': prior_mean,
@@ -198,6 +222,8 @@ class RSSMCell(nn.Module):
             'posterior_std': posterior_std if observation is not None else None,
             'posterior_dist': posterior_dist,
             'reconstructed_obs': reconstructed_obs,
+            'predicted_rewards': predicted_reward,
+            'continue_prob': continue_prob,
         }
 
         return new_state, info
